@@ -24,6 +24,12 @@ import torch.nn as nn
 from Network import TestModel
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import pdb
+from PIL import Image
 
 # from torchvision.datasets.folder
 IMG_EXTENSIONS = (
@@ -77,7 +83,7 @@ def inference(model, x, f, outputpath, patch):
 
     _, _, height, width = x_padded.size()
     start = time.time()
-    out_enc = model.compress(x_padded)
+    out_enc= model.compress(x_padded)
     enc_time = time.time() - start
 
     start = time.time()
@@ -115,8 +121,36 @@ def inference(model, x, f, outputpath, patch):
                out_dec["time"]['y_dec'] * 1000, out_enc["time"]['z_enc'] * 1000, out_enc["time"]['z_dec'] * 1000,
                out_enc["time"]['params'] * 1000]
         write = csv.writer(f)
+
         write.writerow(row)
+ 
+    print("y_size:{}\n".format(out_enc["latent"].shape)) 
+    print("y_hat_size:{}\n".format(out_dec["y_hat"].shape))
     print('bpp:{}, PSNR: {}, encoding time: {}, decoding time: {}'.format(bpp, PSNR, enc_time, dec_time))
+    
+
+    #visualizaiton
+    
+    b,c,h,w = out_enc["latent"].shape
+    y = out_enc["latent"]
+    
+    for i in range(c):
+        latent_c  = np.abs(np.array(y[0,i,:,:].to('cpu')))
+        max_y = latent_c.max()
+        min_y = latent_c.min()
+        latent_c = (latent_c-min_y)/(max_y-min_y+1e-7)
+        #heat_data = pd.DataFrame(latent_c)
+        #plt.imsave(os.path.join(outputpath,'map_{}.png'.format(i)), latent_c, vmin=0, vmax=1, cmap='Greys')
+        #sns.heatmap(heat_data)
+        #plt.savefig(os.path.join(outputpath,'heatmap_{}.png'.format(i)))
+        channel_map = latent_c*255
+        channel_image = Image.fromarray(channel_map)
+        channel_image = channel_image.convert('L')
+        channel_image.save(os.path.join(outputpath,'map_{}.png'.format(i)))
+
+    #print(out_enc["latent"][0,3,:,:])
+    #print(out_dec["y_hat"][0,3,:,:])
+
     return {
         "psnr": PSNR,
         "bpp": bpp,
@@ -126,7 +160,7 @@ def inference(model, x, f, outputpath, patch):
 
 @torch.no_grad()
 def inference_entropy_estimation(model, x, f, outputpath, patch):
-    x = x.unsqueeze(0)
+    x = x.unsqueeze(0) 
     imgpath = f.split('/')
     imgpath[-2] = outputpath
     imgPath = '/'.join(imgpath)
@@ -163,7 +197,44 @@ def inference_entropy_estimation(model, x, f, outputpath, patch):
         (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
         for likelihoods in out_net["likelihoods"].values()
     )
+    
+
+    y_likelihood = out_net["likelihoods"]["y"]
+    channel_num = y_likelihood.shape[1]
+    channel_entropy = np.zeros(channel_num)
+    for ch_idx in range(channel_num):
+        likelihood_ch = y_likelihood[0,ch_idx,:,:]
+        channel_entropy[ch_idx] = torch.log(likelihood_ch).sum()/(-math.log(2))
+        '''
+        likelihood_ch = (torch.log(likelihood_ch))/(-math.log(2))
+        likelihood_min = likelihood_ch.min()
+        likelihood_max = likelihood_ch.max()
+        l_norm = np.array((likelihood_ch-likelihood_min)/(likelihood_max-likelihood_min)*255)
+        l_norm  = Image.fromarray(l_norm)
+        l_norm = l_norm.convert('L')
+        l_norm.save(os.path.join(outputpath,"entropy{}.png".format(ch_idx)))
+        '''
+    
+    x_axis  = np.linspace(0,4,5)
+    y_axis  = np.zeros(5)
+    group = [16,16,32,64,192]
+    index = 0
+    ch_now = 0
+    for ch_slice in group:
+        y_axis[index] = channel_entropy[ch_now:ch_now+ch_slice].sum()
+        index+=1
+        ch_now+=ch_slice
+    
+    plt.figure(figsize=(8,4))
+    plt.title('entropy of each slice')
+    #plt.xticks(np.arange(0,channel_num,10))
+    plt.xlabel('channel')
+    plt.ylabel('entropy')
+    plt.bar(x_axis,y_axis)
+    plt.savefig('entropy2.png')
+
     y_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
+
     z_bpp = (torch.log(out_net["likelihoods"]["y"]).sum() / (-math.log(2) * num_pixels))
 
     torchvision.utils.save_image(out_net["x_hat"], imgPath, nrow=1)
@@ -184,7 +255,47 @@ def inference_entropy_estimation(model, x, f, outputpath, patch):
     }
 
 
-def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpath='Recon', patch=576):
+def distortion_without_channel(model, x, f, outputpath, patch):
+    x = x.unsqueeze(0) 
+    imgpath = f.split('/')
+    imgpath[-2] = outputpath
+    imgPath = '/'.join(imgpath)
+    csvfile = '/'.join(imgpath[:-1]) + '/result.csv'
+    print('decoding img: {}'.format(f))
+    ########original padding
+    channel_num,h, w = x.size(1),x.size(2), x.size(3)
+    p = patch  # maximum 6 strides of 2
+    new_h = (h + p - 1) // p * p
+    new_w = (w + p - 1) // p * p
+    padding_left = (new_w - w) // 2
+    padding_right = new_w - w - padding_left
+    padding_top = (new_h - h) // 2
+    padding_bottom = new_h - h - padding_top
+    x_padded = torch.nn.functional.pad(
+        x,
+        (padding_left, padding_right, padding_top, padding_bottom),
+        mode="constant",
+        value=0,
+    )
+    _, _, height, width = x_padded.size()
+    start = time.time()
+    #out_net = model.mask_inference2(x_padded)
+    #np.save('psnr2.npy',out_net)
+    out_net = np.load('psnr2.npy')
+    x_axis  = np.linspace(0,4,5,dtype=int)
+    y_axis  = out_net 
+    plt.figure(figsize=(8,4))
+    plt.title('psnr without each slice')
+    plt.xlabel('channel')
+    plt.ylabel('psnr')
+    plt.bar(x_axis,y_axis)
+    plt.savefig('psnr2.png')
+
+
+   
+
+
+def eval_model(model, filepaths, entropy_estimation=False, distortion_estimation=False, half=False, outputpath='Recon', patch=576):
     device = next(model.parameters()).device
     metrics = defaultdict(float)
     imgdir = filepaths[0].split('/')
@@ -202,13 +313,15 @@ def eval_model(model, filepaths, entropy_estimation=False, half=False, outputpat
         write.writerow(row)
     for f in filepaths:
         x = read_image(f).to(device)
-        if not entropy_estimation:
+        if entropy_estimation:
+            rv = inference_entropy_estimation(model, x, f, outputpath, patch) 
+        elif distortion_estimation:
+            rv  = distortion_without_channel(model,x,f,outputpath,patch)
+        else:
             if half:
                 model = model.half()
                 x = x.half()
             rv = inference(model, x, f, outputpath, patch)
-        else:
-            rv = inference_entropy_estimation(model, x, f, outputpath, patch)
         for k, v in rv.items():
             metrics[k] += v
     for k, v in metrics.items():
@@ -249,6 +362,10 @@ def setup_args():
         help="use evaluated entropy estimation (no entropy coding)",
     )
     parser.add_argument(
+        "--distortion-estimation",
+        action="store_true",
+    )
+    parser.add_argument(
         "-p",
         "--path",
         dest="paths",
@@ -267,7 +384,8 @@ def setup_args():
 
 def main(argv):
     parser = setup_args()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(['--dataset','/mnt/data1/jingwengu/kodak1','--output_path','./ELIC_0004_ENTROPY','--entropy-estimation','-p',
+                              '/mnt/data1/jingwengu/pretrained_models/ELIC/ELIC_0004_ft_3980_Plateau.pth.tar','--patch','64'])
 
     filepaths = collect_images(args.dataset)
     filepaths = sorted(filepaths)
@@ -286,7 +404,7 @@ def main(argv):
     if args.cuda and torch.cuda.is_available():
         model = model.to("cuda")
 
-    metrics = eval_model(model, filepaths, args.entropy_estimation, args.half, args.output_path, args.patch)
+    metrics = eval_model(model, filepaths, args.entropy_estimation, args.distortion_estimation, args.half, args.output_path, args.patch)
     for k, v in metrics.items():
         results[k].append(v)
 
@@ -300,4 +418,16 @@ def main(argv):
     print(json.dumps(output, indent=2))
 
 if __name__ == "__main__":
+    
+    sys.argv.append("python")
+    sys.argv.append("Inference.py")
+    sys.argv.append("--dataset")
+    sys.argv.append("/mnt/data1/jingwengu/kodak1")
+    sys.argv.append("--output_path")
+    sys.argv.append("./ELIC_0004/ELIC_0004_rate")
+    sys.argv.append("-p ")
+    sys.argv.append("/mnt/data1/jingwengu/pretrained_models/ELIC/ELIC_0004_ft_3980_Plateau.pth.tar")
+    sys.argv.append("--patch") 
+    sys.argv.append("64") 
+    
     main(sys.argv[1:])
